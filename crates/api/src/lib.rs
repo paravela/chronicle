@@ -12,6 +12,7 @@ use chronicle_protocol::{
     messages::ChronicleSubmitTransaction,
     protocol::ChronicleOperationEvent,
 };
+use chronicle_signing::{ChronicleSigning, SecretError};
 use chrono::{DateTime, Utc};
 
 use diesel::{r2d2::ConnectionManager, PgConnection};
@@ -22,7 +23,6 @@ use common::{
     attributes::Attributes,
     commands::*,
     identity::{AuthId, IdentityError},
-    k256::ecdsa::SigningKey,
     ledger::{Commit, SubmissionError, SubmissionStage, SubscriptionError},
     prov::{
         operations::{
@@ -34,9 +34,8 @@ use common::{
         to_json_ld::ToJson,
         ActivityId, AgentId, ChronicleIri, ChronicleTransaction, ChronicleTransactionId,
         Contradiction, EntityId, ExternalId, ExternalIdPart, NamespaceId, ProcessorError,
-        ProvModel, Role, SYSTEM_ID, SYSTEM_UUID,
+        ProvModel, Role, UuidPart, SYSTEM_ID, SYSTEM_UUID,
     },
-    signing::{DirectoryStoredKeys, SignerError},
 };
 
 use metrics::histogram;
@@ -45,11 +44,9 @@ pub use persistence::StoreError;
 use persistence::{Store, MIGRATIONS};
 use r2d2::Pool;
 use std::{
-    collections::HashMap,
     convert::Infallible,
     marker::PhantomData,
     net::AddrParseError,
-    path::Path,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -83,7 +80,7 @@ pub enum ApiError {
     Ledger(#[from] SubmissionError),
 
     #[error("Signing: {0}")]
-    Signing(#[from] SignerError),
+    Signing(#[from] SecretError),
 
     #[error("No agent is currently in use, please call agent use or supply an agent in your call")]
     NoCurrentAgent,
@@ -164,10 +161,9 @@ pub struct Api<
 > {
     _reply_tx: Sender<ApiSendWithReply>,
     submit_tx: tokio::sync::broadcast::Sender<SubmissionStage>,
-    keystore: DirectoryStoredKeys,
+    signing: ChronicleSigning,
     ledger_writer: Arc<BlockingLedgerWriter<W>>,
     store: persistence::Store,
-    signer: SigningKey,
     uuid_source: PhantomData<U>,
     policy_name: Option<String>,
 }
@@ -291,9 +287,9 @@ where
     pub async fn new(
         pool: Pool<ConnectionManager<PgConnection>>,
         ledger: LEDGER,
-        secret_path: &Path,
         uuidgen: U,
-        namespace_bindings: HashMap<String, Uuid>,
+        signing: ChronicleSigning,
+        namespace_bindings: Vec<NamespaceId>,
         policy_name: Option<String>,
         liveness_check_interval: Option<u64>,
     ) -> Result<ApiDispatch, ApiError> {
@@ -305,13 +301,7 @@ where
             notify_commit: commit_notify_tx.clone(),
         };
 
-        let secret_path = secret_path.to_owned();
-
         let store = Store::new(pool.clone())?;
-
-        let keystore = DirectoryStoredKeys::new(secret_path)?;
-        let retrieve_signer = common::signing::directory_signing_key;
-        let signing = keystore.chronicle_signing(retrieve_signer)?;
 
         pool.get()?
             .build_transaction()
@@ -322,8 +312,8 @@ where
 
         // Append namespace bindings and system namespace
         store.namespace_binding(system_namespace_uuid.0, system_namespace_uuid.1)?;
-        for (ns, uuid) in namespace_bindings {
-            store.namespace_binding(&ns, uuid)?
+        for ns in namespace_bindings {
+            store.namespace_binding(ns.external_id_part().as_str(), ns.uuid_part().to_owned())?
         }
 
         let reuse_reader = ledger.clone();
@@ -342,8 +332,7 @@ where
             let mut api = Api::<U, LEDGER> {
                 _reply_tx: commit_tx.clone(),
                 submit_tx: commit_notify_tx.clone(),
-                keystore,
-                signer: signing.clone(),
+                signing,
                 ledger_writer: Arc::new(BlockingLedgerWriter::new(ledger)),
                 store: store.clone(),
                 uuid_source: PhantomData,
@@ -518,14 +507,11 @@ where
         &mut self,
         tx: &ChronicleTransaction,
     ) -> Result<ChronicleTransactionId, ApiError> {
-        let res = self.ledger_writer.do_submit(
-            &ChronicleSubmitTransaction {
-                tx: tx.clone(),
-                signer: self.signer.clone(),
-                policy_name: self.policy_name.clone(),
-            },
-            &self.signer,
-        );
+        let res = self.ledger_writer.submit(&ChronicleSubmitTransaction {
+            tx: tx.clone(),
+            signer: self.signing.clone(),
+            policy_name: self.policy_name.clone(),
+        });
 
         match res {
             Ok(tx_id) => {
@@ -555,8 +541,7 @@ where
         identity: AuthId,
         to_apply: Vec<ChronicleOperation>,
     ) -> Result<ApiResponse, ApiError> {
-        let kms = common::signing::KMS::Directory(&self.keystore);
-        let identity = identity.signed_identity(kms)?;
+        let identity = identity.signed_identity(&self.signing)?;
         let model = ProvModel::from_tx(&to_apply)?;
         let tx_id = self.submit_blocking(&ChronicleTransaction::new(to_apply, identity))?;
 
@@ -981,7 +966,7 @@ where
         identity: AuthId,
         to_apply: Vec<ChronicleOperation>,
     ) -> Result<ApiResponse, ApiError> {
-        let identity = identity.signed_identity(common::signing::KMS::Directory(&self.keystore))?;
+        let identity = identity.signed_identity(&self.signing)?;
         let tx_id = self.submit_blocking(&ChronicleTransaction::new(to_apply, identity))?;
         Ok(ApiResponse::depth_charge_submission(tx_id))
     }
@@ -1348,7 +1333,7 @@ where
         operations: Vec<ChronicleOperation>,
     ) -> Result<ApiResponse, ApiError> {
         let mut api = self.clone();
-        let identity = identity.signed_identity(common::signing::KMS::Directory(&self.keystore))?;
+        let identity = identity.signed_identity(&self.signing)?;
         let model = ProvModel::from_tx(&operations)?;
         tokio::task::spawn_blocking(move || {
             // Check here to ensure that import operations result in data changes
@@ -1595,6 +1580,10 @@ mod test {
 
     use crate::{inmem::EmbeddedChronicleTp, Api, ApiDispatch, ApiError, UuidGen};
 
+    use chronicle_signing::{
+        chronicle_secret_names, ChronicleSecretsOptions, ChronicleSigning, BATCHER_NAMESPACE,
+        CHRONICLE_NAMESPACE,
+    };
     use chrono::{TimeZone, Utc};
     use common::{
         attributes::{Attribute, Attributes},
@@ -1611,14 +1600,12 @@ mod test {
             ActivityId, AgentId, ChronicleTransactionId, DomaintypeId, EntityId, ExpandedJson,
             NamespaceId, ProvModel,
         },
-        signing::DirectoryStoredKeys,
     };
     use opa_tp_protocol::state::{policy_address, policy_meta_address, PolicyMeta};
     use protobuf::Message;
     use sawtooth_sdk::messages::setting::{Setting, Setting_Entry};
 
-    use std::collections::HashMap;
-    use tempfile::TempDir;
+    
     use uuid::Uuid;
 
     struct TestDispatch<'a> {
@@ -1732,12 +1719,21 @@ mod test {
     async fn test_api<'a>() -> TestDispatch<'a> {
         chronicle_telemetry::telemetry(None, chronicle_telemetry::ConsoleLogging::Pretty);
 
-        let secretpath = TempDir::new().unwrap().into_path();
-
-        let keystore_path = secretpath.clone();
-        let keystore = DirectoryStoredKeys::new(keystore_path).unwrap();
-        keystore.generate_chronicle().unwrap();
-
+        let secrets = ChronicleSigning::new(
+            chronicle_secret_names(),
+            vec![
+                (
+                    CHRONICLE_NAMESPACE.to_string(),
+                    ChronicleSecretsOptions::generate_in_memory(),
+                ),
+                (
+                    BATCHER_NAMESPACE.to_string(),
+                    ChronicleSecretsOptions::generate_in_memory(),
+                ),
+            ],
+        )
+        .await
+        .unwrap();
         let embed_tp = embed_chronicle_tp();
         let database = TemporaryDatabase::default();
         let pool = database.connection_pool().unwrap();
@@ -1747,9 +1743,9 @@ mod test {
         let dispatch = Api::new(
             pool,
             embed_tp.ledger.clone(),
-            &secretpath,
             SameUuid,
-            HashMap::default(),
+            secrets,
+            vec![],
             Some("allow_transactions".into()),
             liveness_check_interval,
         )

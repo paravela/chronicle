@@ -153,7 +153,7 @@ impl ProvModel {
             trace!(to_apply_compact=%serde_json::to_string_pretty(&json)?);
 
             use json_ld::Expand;
-            let output = json_ld::syntax::Value::from_serde_json(json, |_| ())
+            let output = json_ld::syntax::Value::from_serde_json(json.clone(), |_| ())
                 .expand(&mut ContextLoader)
                 .await
                 .map_err(|e| ProcessorError::Expansion {
@@ -165,7 +165,7 @@ impl ProvModel {
                     .value()
                     .inner()
                     .as_node()
-                    .ok_or(ProcessorError::NotANode)?;
+                    .ok_or(ProcessorError::NotANode(json.clone()))?;
 
                 if o.has_type(&id_from_iri(&Chronicle::Namespace)) {
                     self.apply_node_as_namespace(o)?;
@@ -771,7 +771,7 @@ impl Operation for Node<IriBuf, BlankIdBuf, ()> {
 impl ChronicleOperation {
     pub async fn from_json(ExpandedJson(json): ExpandedJson) -> Result<Self, ProcessorError> {
         use json_ld::Expand;
-        let output = json_ld::syntax::Value::from_serde_json(json, |_| ())
+        let output = json_ld::syntax::Value::from_serde_json(json.clone(), |_| ())
             .expand(&mut ContextLoader)
             .await
             .map_err(|e| ProcessorError::Expansion {
@@ -782,7 +782,7 @@ impl ChronicleOperation {
                 .value()
                 .inner()
                 .as_node()
-                .ok_or(ProcessorError::NotANode)?;
+                .ok_or(ProcessorError::NotANode(json.clone()))?;
             if o.has_type(&id_from_iri(&ChronicleOperations::CreateNamespace)) {
                 let namespace = o.namespace();
                 let external_id = namespace.external_id_part().to_owned();
@@ -955,7 +955,7 @@ impl ChronicleOperation {
                 unreachable!()
             }
         } else {
-            Err(ProcessorError::NotANode {})
+            Err(ProcessorError::NotANode(json.clone()))
         }
     }
 }

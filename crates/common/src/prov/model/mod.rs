@@ -65,8 +65,8 @@ pub enum ProcessorError {
         iri: String,
         object: serde_json::Value,
     },
-    #[error("Json LD object is not a node")]
-    NotANode,
+    #[error("Json LD object is not a node {0}")]
+    NotANode(serde_json::Value),
     #[error("Chronicle value is not a JSON object")]
     NotAnObject,
     #[error("OpaExecutorError: {0}")]

@@ -11,7 +11,6 @@ use async_graphql_poem::{
 use chrono::NaiveDateTime;
 use common::{
     identity::{AuthId, IdentityError, JwtClaims, OpaData, SignedIdentity},
-    k256::schnorr::signature::Signature,
     ledger::{SubmissionError, SubmissionStage},
     opa::{ExecutorContext, OpaExecutorError},
     prov::{
@@ -294,7 +293,7 @@ impl From<SignedIdentity> for CommitIdentity {
             identity: identity.identity,
             signature: identity
                 .signature
-                .map(|x| hex::encode(x.as_bytes()))
+                .map(|x| hex::encode(&*x))
                 .unwrap_or_else(|| "".to_string()),
             verifying_key: identity
                 .verifying_key

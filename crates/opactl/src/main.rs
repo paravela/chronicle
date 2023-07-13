@@ -1,12 +1,12 @@
 use async_stl_client::zmq_client::{
     HighestBlockValidatorSelector, ZmqRequestResponseSawtoothChannel,
 };
+use chronicle_signing::{OpaKnownKeyNamesSigner, SecretError, OPA_PK};
 use clap::ArgMatches;
-use cli::{load_key_from_match, Wait};
+use cli::{configure_signing, Wait};
 use common::import::{load_bytes_from_url, FromUrlError};
-use futures::{channel::oneshot, join, Future, FutureExt, StreamExt};
+use futures::{channel::oneshot, Future, FutureExt, StreamExt};
 use k256::{
-    ecdsa::SigningKey,
     pkcs8::{EncodePrivateKey, LineEnding},
     SecretKey,
 };
@@ -62,6 +62,12 @@ pub enum OpaCtlError {
 
     #[error("Utf8 error: {0}")]
     Utf8(#[from] std::str::Utf8Error),
+
+    #[error("Signing: {0}")]
+    Signing(#[from] SecretError),
+
+    #[error("Missing Argument")]
+    MissingArgument(String),
 }
 
 impl UFE for OpaCtlError {}
@@ -171,32 +177,25 @@ async fn handle_wait<
     reader: R,
     writer: W,
     submission: OpaSubmitTransaction,
-    transactor_key: &SigningKey,
 ) -> Result<(Waited, R), OpaCtlError> {
     let wait = Wait::from_matches(matches);
-    let (tx_id, tx) = writer.pre_submit(&submission).await?;
     match wait {
         Wait::NoWait => {
-            debug!(submitting_tx=%tx_id);
-            writer.submit(tx, transactor_key).await?;
+            writer.submit(&submission).await.map_err(|(_id, e)| e)?;
 
             Ok((Waited::NoWait, reader))
         }
         Wait::NumberOfBlocks(blocks) => {
-            debug!(submitting_tx=%tx_id, waiting_blocks=%blocks);
+            let tx_id = writer.submit(&submission).await.map_err(|(_id, e)| e)?;
+            debug!(awaiting_tx=%tx_id, waiting_blocks=%blocks);
             let waiter = ambient_transactions(reader.clone(), tx_id.clone(), blocks).await;
-            let writer = writer.submit(tx, transactor_key);
-
-            match join!(writer, waiter) {
-                (Err(e), _) => Err(e.into()),
-                (_, Ok(Waited::WaitedAndDidNotFind)) => {
-                    Err(OpaCtlError::TransactionNotFound(tx_id))
-                }
-                (_, Ok(Waited::WaitedAndOperationFailed(OpaOperationEvent::Error(e)))) => {
+            match waiter.await {
+                Ok(Waited::WaitedAndDidNotFind) => Err(OpaCtlError::TransactionNotFound(tx_id)),
+                Ok(Waited::WaitedAndOperationFailed(OpaOperationEvent::Error(e))) => {
                     Err(OpaCtlError::TransactionFailed(e))
                 }
-                (_, Ok(x)) => Ok((x, reader)),
-                (_, Err(e)) => Err(OpaCtlError::Cancelled(e)),
+                Ok(x) => Ok((x, reader)),
+                Err(e) => Err(OpaCtlError::Cancelled(e)),
             }
         }
     }
@@ -219,16 +218,14 @@ async fn dispatch_args<
     let span_id = span.id().map(|x| x.into_u64()).unwrap_or(u64::MAX);
     match matches.subcommand() {
         Some(("bootstrap", matches)) => {
-            let root_key: SigningKey = load_key_from_match("root-key", matches).into();
-            let transactor_key: SigningKey = load_key_from_match("transactor-key", matches).into();
+            let signing = configure_signing(matches).await?;
             let bootstrap =
-                SubmissionBuilder::bootstrap_root(root_key.verifying_key()).build(span_id);
+                SubmissionBuilder::bootstrap_root(signing.opa_verifying().await?).build(span_id);
             Ok(handle_wait(
                 matches,
                 reader,
                 writer,
-                OpaSubmitTransaction::bootstrap_root(bootstrap, &transactor_key),
-                &transactor_key,
+                OpaSubmitTransaction::bootstrap_root(bootstrap, &signing),
             )
             .await?)
         }
@@ -248,87 +245,81 @@ async fn dispatch_args<
             Ok((Waited::NoWait, reader))
         }
         Some(("rotate-root", matches)) => {
-            let current_root_key: SigningKey =
-                load_key_from_match("current-root-key", matches).into();
-            let new_root_key: SigningKey = load_key_from_match("new-root-key", matches).into();
-            let transactor_key: SigningKey = load_key_from_match("transactor-key", matches).into();
+            let signing = configure_signing(matches).await?;
             let rotate_key = SubmissionBuilder::rotate_key(
                 "root",
-                &current_root_key,
-                &new_root_key,
-                &current_root_key,
+                &signing,
+                OPA_PK,
+                matches
+                    .get_one::<String>("new_key")
+                    .ok_or_else(|| OpaCtlError::MissingArgument("new_key".to_owned()))?,
             )
+            .await?
             .build(span_id);
             Ok(handle_wait(
                 matches,
                 reader,
                 writer,
-                OpaSubmitTransaction::rotate_root(rotate_key, &transactor_key),
-                &transactor_key,
+                OpaSubmitTransaction::rotate_root(rotate_key, &signing),
             )
             .await?)
         }
         Some(("register-key", matches)) => {
-            let current_root_key: SigningKey = load_key_from_match("root-key", matches).into();
-            let new_key: SigningKey = load_key_from_match("new-key", matches).into();
+            let signing = configure_signing(matches).await?;
+            let new_key = &matches
+                .get_one::<String>("new_key")
+                .ok_or_else(|| OpaCtlError::MissingArgument("new_key".to_owned()))?;
             let id = matches.get_one::<String>("id").unwrap();
-            let transactor_key: SigningKey = load_key_from_match("transactor-key", matches).into();
             let overwrite_existing = matches.get_flag("overwrite");
-            let register_key = SubmissionBuilder::register_key(
-                id,
-                &new_key.verifying_key(),
-                &current_root_key,
-                overwrite_existing,
-            )
-            .build(span_id);
-            Ok(handle_wait(
-                matches,
-                reader,
-                writer,
-                OpaSubmitTransaction::register_key(
-                    id,
-                    register_key,
-                    &transactor_key,
-                    overwrite_existing,
-                ),
-                &transactor_key,
-            )
-            .await?)
-        }
-        Some(("rotate-key", matches)) => {
-            let current_root_key: SigningKey = load_key_from_match("root-key", matches).into();
-            let current_key: SigningKey = load_key_from_match("current-key", matches).into();
-            let id = matches.get_one::<String>("id").unwrap();
-            let new_key: SigningKey = load_key_from_match("new-key", matches).into();
-            let transactor_key: SigningKey = load_key_from_match("transactor-key", matches).into();
-            let rotate_key =
-                SubmissionBuilder::rotate_key("root", &current_key, &new_key, &current_root_key)
+            let register_key =
+                SubmissionBuilder::register_key(id, new_key, &signing, overwrite_existing)
+                    .await?
                     .build(span_id);
             Ok(handle_wait(
                 matches,
                 reader,
                 writer,
-                OpaSubmitTransaction::rotate_key(id, rotate_key, &transactor_key),
-                &transactor_key,
+                OpaSubmitTransaction::register_key(id, register_key, &signing, overwrite_existing),
+            )
+            .await?)
+        }
+        Some(("rotate-key", matches)) => {
+            let signing = configure_signing(matches).await?;
+
+            let current_key = &matches
+                .get_one::<String>("current_key")
+                .ok_or_else(|| OpaCtlError::MissingArgument("new_key".to_owned()))?;
+            let new_key = &matches
+                .get_one::<String>("new_key")
+                .ok_or_else(|| OpaCtlError::MissingArgument("new_key".to_owned()))?;
+            let id = matches.get_one::<String>("id").unwrap();
+            let rotate_key = SubmissionBuilder::rotate_key(id, &signing, new_key, current_key)
+                .await?
+                .build(span_id);
+            Ok(handle_wait(
+                matches,
+                reader,
+                writer,
+                OpaSubmitTransaction::rotate_key(id, rotate_key, &signing),
             )
             .await?)
         }
         Some(("set-policy", matches)) => {
-            let root_key: SigningKey = load_key_from_match("root-key", matches).into();
-            let transactor_key: SigningKey = load_key_from_match("transactor-key", matches).into();
+            let signing = configure_signing(matches).await?;
             let policy: &String = matches.get_one("policy").unwrap();
 
             let policy = load_bytes_from_url(policy).await?;
 
             let id = matches.get_one::<String>("id").unwrap();
 
-            let bootstrap = SubmissionBuilder::set_policy(id, policy, root_key).build(span_id);
+            let bootstrap = SubmissionBuilder::set_policy(id, policy, &signing)
+                .await?
+                .build(span_id);
             Ok(handle_wait(
                 matches,
                 reader,
                 writer,
-                OpaSubmitTransaction::set_policy(id, bootstrap, &transactor_key),
-                &transactor_key,
+                OpaSubmitTransaction::set_policy(id, bootstrap, &signing),
             )
             .await?)
         }

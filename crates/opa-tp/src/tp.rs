@@ -333,7 +333,7 @@ fn apply_signed_operation_payload(
 
 fn root_keys_from_state(
     _request: &TpProcessRequest,
-    context: &mut dyn TransactionContext,
+    context: &dyn TransactionContext,
 ) -> Result<Option<Keys>, OpaTpError> {
     let existing_key = context.get_state_entry(&key_address("root"))?;
 
@@ -419,6 +419,10 @@ impl TransactionHandler for OpaTransactionHandler {
 #[cfg(test)]
 mod test {
     use async_stl_client::sawtooth::MessageBuilder;
+    use chronicle_signing::{
+        chronicle_secret_names, ChronicleKnownKeyNamesSigner, ChronicleSigning, BATCHER_NAMESPACE,
+        CHRONICLE_NAMESPACE, OPA_PK,
+    };
     use k256::{ecdsa::SigningKey, SecretKey};
     use opa_tp_protocol::{
         address,
@@ -564,7 +568,7 @@ mod test {
         mut context: TestTransactionContext,
         addresses: &[String],
         submission: &Submission,
-        transactor_key: &SigningKey,
+        signer: &ChronicleSigning,
     ) -> TestTransactionContext {
         let message_builder = MessageBuilder::new_deterministic(address::FAMILY, address::VERSION);
         let (tx, id) = message_builder
@@ -573,9 +577,15 @@ mod test {
                 addresses.to_vec(),
                 vec![],
                 submission,
-                transactor_key,
+                signer.batcher_verifying().await.unwrap(),
+                |bytes| {
+                    let signer = signer.clone();
+                    let bytes = bytes.to_vec();
+                    async move { signer.batcher_sign(&bytes).await }
+                },
             )
-            .await;
+            .await
+            .unwrap();
         let processor = OpaTransactionHandler::new();
         let header =
             <TransactionHeader as protobuf::Message>::parse_from_bytes(&tx.header).unwrap();
@@ -604,12 +614,12 @@ mod test {
         );
     }
 
-    /// Applies a transaction `submission` to `context` using `transactor_key`,
+    /// Applies a transaction `submission` to `context` using `batcher_key`,
     /// `number_of_determinism_checking_cycles` times, checking for determinism between
     /// each cycle.
     async fn submission_to_state(
         context: TestTransactionContext,
-        transactor_key: SigningKey,
+        signer: ChronicleSigning,
         addresses: &[String],
         submission: Submission,
     ) -> TestTransactionContext {
@@ -626,7 +636,7 @@ mod test {
         let mut results = Vec::with_capacity(number_of_determinism_checking_cycles);
 
         for context in contexts {
-            let result = apply_tx(context, addresses, &submission, &transactor_key).await;
+            let result = apply_tx(context, addresses, &submission, &signer).await;
             results.push(result);
         }
 
@@ -649,13 +659,13 @@ mod test {
 
     #[tokio::test]
     async fn bootstrap_from_initial_state() {
-        let root_key = key_from_seed(0);
+        let secrets = chronicle_signing().await;
         let context = TestTransactionContext::new();
-        let builder = SubmissionBuilder::bootstrap_root(root_key.verifying_key());
+        let builder = SubmissionBuilder::bootstrap_root(secrets.batcher_verifying().await.unwrap());
         let submission = builder.build(0xffff);
 
         let context =
-            submission_to_state(context, root_key, &[key_address("root")], submission).await;
+            submission_to_state(context, secrets, &[key_address("root")], submission).await;
 
         insta::assert_yaml_snapshot!(context.readable_state(), {
             ".**.date" => "[date]",
@@ -686,79 +696,55 @@ mod test {
         "###);
     }
 
-    #[tokio::test]
-    async fn bootstrap_from_initial_state_does_not_require_transactor_key() {
-        let root_key = key_from_seed(0);
-        let context = TestTransactionContext::new();
-        let another_key = key_from_seed(1);
-        let builder = SubmissionBuilder::bootstrap_root(root_key.verifying_key());
-        let submission = builder.build(0xffff);
-
-        let context =
-            submission_to_state(context, another_key, &[key_address("root")], submission).await;
-
-        insta::assert_yaml_snapshot!(context.readable_state(),{
-            ".**.date" => "[date]",
-            ".**.transaction_id" => "[hash]",
-            ".**.key" => "[pem]",
-        }, @r###"
-        ---
-        - - 7ed19313e8ece6c4f5551b9bd1090797ad25c6d85f7b523b2214d4fe448372279aa95c
-          - current:
-              key: "[pem]"
-              version: 0
-            expired: ~
-            id: root
-        "### );
-        insta::assert_yaml_snapshot!(context.readable_events(), {
-            ".**.date" => "[date]",
-            ".**.transaction_id" => "[hash]",
-            ".**.key" => "[pem]",
-        }, @r###"
-        ---
-        - - opa/operation
-          - - - transaction_id
-              - 3b8241d24ff6c90035ed8f64f3b6ffc64999670d9b8406a7fe717976ea650a164581fec952450e1284b36079748c794ddb8b5776b1db2384a38cd872d3f75737
-          - KeyUpdate:
-              current:
-                key: "[pem]"
-                version: 0
-              expired: ~
-              id: root
-        "###);
-    }
-
     /// Needed for further tests
-    async fn bootstrap_root() -> (TestTransactionContext, SigningKey) {
-        let root_key = key_from_seed(0);
+    async fn bootstrap_root() -> (TestTransactionContext, ChronicleSigning) {
+        let secrets = chronicle_signing().await;
 
         let context = TestTransactionContext::new();
-        let builder = SubmissionBuilder::bootstrap_root(root_key.verifying_key());
+        let builder = SubmissionBuilder::bootstrap_root(secrets.batcher_verifying().await.unwrap());
         let submission = builder.build(0xffff);
 
         (
-            submission_to_state(
-                context,
-                root_key.clone(),
-                &[key_address("root")],
-                submission,
-            )
-            .await,
-            root_key,
+            submission_to_state(context, secrets.clone(), &[key_address("root")], submission).await,
+            secrets,
         )
+    }
+
+    async fn chronicle_signing() -> ChronicleSigning {
+        let mut names = chronicle_secret_names();
+        names.append(&mut vec![
+            (CHRONICLE_NAMESPACE.to_string(), "rotate_root".to_string()),
+            (CHRONICLE_NAMESPACE.to_string(), "non_root_1".to_string()),
+            (CHRONICLE_NAMESPACE.to_string(), "non_root_2".to_string()),
+        ]);
+
+        ChronicleSigning::new(
+            names,
+            vec![
+                (
+                    CHRONICLE_NAMESPACE.to_string(),
+                    chronicle_signing::ChronicleSecretsOptions::test_keys(),
+                ),
+                (
+                    BATCHER_NAMESPACE.to_string(),
+                    chronicle_signing::ChronicleSecretsOptions::test_keys(),
+                ),
+            ],
+        )
+        .await
+        .unwrap()
     }
 
     #[tokio::test]
     async fn rotate_root() {
-        let old_key = key_from_seed(0);
-
-        let (context, root_key) = bootstrap_root().await;
-        let new_root = key_from_seed(1);
-        let builder = SubmissionBuilder::rotate_key("root", &old_key, &new_root, &root_key);
+        let (context, signing) = bootstrap_root().await;
+        let builder = SubmissionBuilder::rotate_key("root", &signing, "opa-pk", "new_root_1")
+            .await
+            .unwrap();
         let submission = builder.build(0xffff);
 
         let context =
-            submission_to_state(context, old_key, &[key_address("root")], submission).await;
+            submission_to_state(context, signing, &[key_address("root")], submission).await;
 
         insta::assert_yaml_snapshot!(context.readable_state(),{
             ".**.date" => "[date]",
@@ -808,19 +794,16 @@ mod test {
 
     #[tokio::test]
     async fn register_valid_key() {
-        let (context, root_key) = bootstrap_root().await;
-        let non_root_key = key_from_seed(1);
+        let (context, signing) = bootstrap_root().await;
+        let _non_root_key = key_from_seed(1);
 
-        let builder = SubmissionBuilder::register_key(
-            "nonroot",
-            &non_root_key.verifying_key(),
-            &root_key,
-            false,
-        );
+        let builder = SubmissionBuilder::register_key("nonroot", "key_1", &signing, false)
+            .await
+            .unwrap();
         let submission = builder.build(0xffff);
 
         let context =
-            submission_to_state(context, root_key, &[key_address("nonroot")], submission).await;
+            submission_to_state(context, signing, &[key_address("nonroot")], submission).await;
 
         insta::assert_yaml_snapshot!(context.readable_state(),{
             ".**.date" => "[date]",
@@ -870,32 +853,30 @@ mod test {
 
     #[tokio::test]
     async fn rotate_valid_key() {
-        let (context, root_key) = bootstrap_root().await;
-        let non_root_key = key_from_seed(1);
+        let (context, signing) = bootstrap_root().await;
+        let _non_root_key = key_from_seed(1);
 
-        let builder = SubmissionBuilder::register_key(
-            "nonroot",
-            &non_root_key.verifying_key(),
-            &root_key,
-            false,
-        );
+        let builder = SubmissionBuilder::register_key("nonroot", "key_1", &signing, false)
+            .await
+            .unwrap();
         let submission = builder.build(0xffff);
 
         let context = submission_to_state(
             context,
-            root_key.clone(),
+            signing.clone(),
             &[key_address("nonroot")],
             submission,
         )
         .await;
 
-        let new_non_root = key_from_seed(2);
-        let builder =
-            SubmissionBuilder::rotate_key("nonroot", &non_root_key, &new_non_root, &root_key);
+        let _new_non_root = key_from_seed(2);
+        let builder = SubmissionBuilder::rotate_key("nonroot", &signing, "key_1", "key_2")
+            .await
+            .unwrap();
         let submission = builder.build(0xffff);
 
         let context =
-            submission_to_state(context, root_key, &[key_address("nonroot")], submission).await;
+            submission_to_state(context, signing, &[key_address("nonroot")], submission).await;
 
         insta::assert_yaml_snapshot!(context.readable_state(),{
             ".**.date" => "[date]",
@@ -957,16 +938,13 @@ mod test {
     }
 
     #[tokio::test]
-    async fn cannot_register_key_as_nonroot() {
+    async fn register_key_as_nonroot() {
         let (context, root_key) = bootstrap_root().await;
-        let non_root_key = key_from_seed(1);
+        let _non_root_key = key_from_seed(1);
 
-        let builder = SubmissionBuilder::register_key(
-            "root",
-            &non_root_key.verifying_key(),
-            &root_key,
-            false,
-        );
+        let builder = SubmissionBuilder::register_key("root", "key_1", &root_key, false)
+            .await
+            .unwrap();
         let submission = builder.build(0xffff);
 
         let context =
@@ -1008,10 +986,10 @@ mod test {
     #[tokio::test]
     async fn cannot_register_key_as_nonroot_with_overwrite() {
         let (context, root_key) = bootstrap_root().await;
-        let non_root_key = key_from_seed(1);
 
-        let builder =
-            SubmissionBuilder::register_key("root", &non_root_key.verifying_key(), &root_key, true);
+        let builder = SubmissionBuilder::register_key("root", "key_1", &root_key, true)
+            .await
+            .unwrap();
         let submission = builder.build(0xffff);
 
         let context =
@@ -1052,35 +1030,28 @@ mod test {
 
     #[tokio::test]
     async fn cannot_register_existing_key() {
-        let (context, root_key) = bootstrap_root().await;
-        let non_root_key = key_from_seed(1);
+        let (context, signing) = bootstrap_root().await;
 
-        let builder = SubmissionBuilder::register_key(
-            "nonroot",
-            &non_root_key.verifying_key(),
-            &root_key,
-            false,
-        );
+        let builder = SubmissionBuilder::register_key("nonroot", "key_1", &signing, false)
+            .await
+            .unwrap();
         let submission = builder.build(0xffff);
 
         let context = submission_to_state(
             context,
-            root_key.clone(),
+            signing.clone(),
             &[key_address("nonroot")],
             submission,
         )
         .await;
 
-        let builder = SubmissionBuilder::register_key(
-            "nonroot",
-            &non_root_key.verifying_key(),
-            &root_key,
-            false,
-        );
+        let builder = SubmissionBuilder::register_key("nonroot", "key_1", &signing, false)
+            .await
+            .unwrap();
         let submission = builder.build(0xffff);
 
         let context =
-            submission_to_state(context, root_key, &[key_address("nonroot")], submission).await;
+            submission_to_state(context, signing, &[key_address("nonroot")], submission).await;
 
         insta::assert_yaml_snapshot!(context.readable_state(),{
             ".**.date" => "[date]",
@@ -1133,14 +1104,11 @@ mod test {
     #[tokio::test]
     async fn can_register_existing_key_with_overwrite() {
         let (context, root_key) = bootstrap_root().await;
-        let non_root_key = key_from_seed(1);
+        let _non_root_key = key_from_seed(1);
 
-        let builder = SubmissionBuilder::register_key(
-            "nonroot",
-            &non_root_key.verifying_key(),
-            &root_key,
-            false,
-        );
+        let builder = SubmissionBuilder::register_key("nonroot", "key_1", &root_key, false)
+            .await
+            .unwrap();
         let submission = builder.build(0xffff);
 
         let context = submission_to_state(
@@ -1151,12 +1119,9 @@ mod test {
         )
         .await;
 
-        let builder = SubmissionBuilder::register_key(
-            "nonroot",
-            &non_root_key.verifying_key(),
-            &root_key,
-            true,
-        );
+        let builder = SubmissionBuilder::register_key("nonroot", "key_1", &root_key, true)
+            .await
+            .unwrap();
         let submission = builder.build(0xffff);
 
         let context =
@@ -1219,15 +1184,15 @@ mod test {
 
     #[tokio::test]
     async fn cannot_register_existing_root_key_with_overwrite() {
-        let (context, root_key) = bootstrap_root().await;
-        let new_root_key = key_from_seed(1);
+        let (context, signing) = bootstrap_root().await;
 
-        let builder =
-            SubmissionBuilder::register_key("root", &new_root_key.verifying_key(), &root_key, true);
+        let builder = SubmissionBuilder::register_key("root", OPA_PK, &signing, true)
+            .await
+            .unwrap();
         let submission = builder.build(0xffff);
 
         let context =
-            submission_to_state(context, root_key, &[key_address("root")], submission).await;
+            submission_to_state(context, signing, &[key_address("root")], submission).await;
 
         insta::assert_yaml_snapshot!(context.readable_state(),{
             ".**.date" => "[date]",
@@ -1264,15 +1229,17 @@ mod test {
 
     #[tokio::test]
     async fn set_a_policy() {
-        let (context, root_key) = bootstrap_root().await;
+        let (context, signing) = bootstrap_root().await;
 
         // Policies can only be set by the root key owner
-        let builder = SubmissionBuilder::set_policy("test", vec![0, 1, 2, 3], root_key.clone());
+        let builder = SubmissionBuilder::set_policy("test", vec![0, 1, 2, 3], &signing)
+            .await
+            .unwrap();
 
         let submission = builder.build(0xffff);
 
         let context =
-            submission_to_state(context, root_key, &[key_address("nonroot")], submission).await;
+            submission_to_state(context, signing, &[key_address("nonroot")], submission).await;
 
         insta::assert_yaml_snapshot!(context.readable_state(),{
             ".**.date" => "[date]",

@@ -1,7 +1,8 @@
-use common::{
-    k256::ecdsa::SigningKey,
-    prov::{to_json_ld::ToJson, ChronicleTransaction},
-};
+use std::sync::Arc;
+
+use chronicle_signing::{ChronicleKnownKeyNamesSigner, ChronicleSigning, SecretError};
+use common::prov::{to_json_ld::ToJson, ChronicleTransaction};
+use k256::ecdsa::VerifyingKey;
 use opa_tp_protocol::state::{policy_address, policy_meta_address};
 use serde_json::json;
 
@@ -23,7 +24,7 @@ use prost::Message;
 #[derive(Debug, Clone)]
 pub struct ChronicleSubmitTransaction {
     pub tx: ChronicleTransaction,
-    pub signer: SigningKey,
+    pub signer: ChronicleSigning,
     pub policy_name: Option<String>,
 }
 
@@ -42,8 +43,9 @@ impl TransactionPayload for ChronicleSubmitTransaction {
 
         let mut ops = Vec::with_capacity(self.tx.tx.len());
         for op in &self.tx.tx {
-            let op_json = op.to_json().compact().await?;
-            ops.push(op_json);
+            let op_json = op.to_json();
+            let compact_json_string = op_json.compact().await?.to_string();
+            ops.push(compact_json_string);
         }
 
         let ops_json =
@@ -59,7 +61,11 @@ impl TransactionPayload for ChronicleSubmitTransaction {
 }
 
 impl ChronicleSubmitTransaction {
-    pub fn new(tx: ChronicleTransaction, signer: SigningKey, policy_name: Option<String>) -> Self {
+    pub fn new(
+        tx: ChronicleTransaction,
+        signer: ChronicleSigning,
+        policy_name: Option<String>,
+    ) -> Self {
         Self {
             tx,
             signer,
@@ -70,10 +76,14 @@ impl ChronicleSubmitTransaction {
 
 #[async_trait::async_trait]
 impl LedgerTransaction for ChronicleSubmitTransaction {
-    fn signer(&self) -> &SigningKey {
-        &self.signer
+    type Error = SecretError;
+    async fn sign(&self, bytes: Arc<Vec<u8>>) -> Result<Vec<u8>, SecretError> {
+        self.signer.batcher_sign(&bytes).await
     }
 
+    async fn verifying_key(&self) -> Result<VerifyingKey, SecretError> {
+        self.signer.batcher_verifying().await
+    }
     fn addresses(&self) -> Vec<String> {
         self.tx
             .tx
@@ -88,7 +98,7 @@ impl LedgerTransaction for ChronicleSubmitTransaction {
     async fn as_sawtooth_tx(
         &self,
         message_builder: &MessageBuilder,
-    ) -> (async_stl_client::messages::Transaction, TransactionId) {
+    ) -> Result<(async_stl_client::messages::Transaction, TransactionId), Self::Error> {
         //Ensure we append any opa policy binary address and meta address to the
         //list of addresses, along with the settings address
         let mut addresses: Vec<_> = self
@@ -110,7 +120,18 @@ impl LedgerTransaction for ChronicleSubmitTransaction {
                 .collect();
         }
         message_builder
-            .make_sawtooth_transaction(addresses.clone(), addresses, vec![], self, self.signer())
+            .make_sawtooth_transaction(
+                addresses.clone(),
+                addresses,
+                vec![],
+                self,
+                self.signer.batcher_verifying().await?,
+                |bytes| {
+                    let signer = self.signer.clone();
+                    let bytes = bytes.to_vec();
+                    async move { signer.batcher_sign(&bytes).await }
+                },
+            )
             .await
     }
 }

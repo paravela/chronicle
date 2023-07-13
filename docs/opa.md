@@ -278,7 +278,7 @@ The `bootstrap` command initializes the OPA Transaction Processor with a root ke
 - `--root-key` (`-r`): A required argument that specifies the path to the PEM-encoded
   private key to be used as the root key.
 
-- `--transactor-key` (`-t`): An optional argument that specifies the path to the
+- `--batcher-key` (`-t`): An optional argument that specifies the path to the
   PEM-encoded private key to be used for signing a transaction. If not specified,
   an ephemeral key will be generated.
 
@@ -313,7 +313,7 @@ The `rotate-root` command rotates the root key for the OPA Transaction Processor
 - `--new-root-key` (`-n`): A required argument that specifies the path to the
   PEM-encoded private key to be registered as the new root key.
 
-- `--transactor-key` (`-t`): An optional argument that specifies the path to the
+- `--batcher-key` (`-t`): An optional argument that specifies the path to the
   PEM-encoded private key to be used for signing the transaction. If not
   specified, an ephemeral key will be generated.
 
@@ -339,7 +339,7 @@ processor.
 - `--id` (`-i`): A required argument that specifies the name to associate with
   the new key.
 
-- `--transactor-key` (`-t`): An optional argument that specifies the path to
+- `--batcher-key` (`-t`): An optional argument that specifies the path to
   the PEM-encoded private key to be used for signing the transaction. If not
   specified, an ephemeral key will be generated.
 
@@ -371,7 +371,7 @@ Transaction Processor.
 - `--id` (`-i`): A required argument that specifies the ID of the key to be
   rotated.
 
-- `--transactor-key` (`-t`): An optional argument that specifies the path to
+- `--batcher-key` (`-t`): An optional argument that specifies the path to
   the PEM-encoded private key to be used for signing the transaction. If not
   specified, an ephemeral key will be generated.
 
@@ -395,8 +395,8 @@ arguments:
 - `--root-key` (`-k`): A required argument that specifies the path of a
   PEM-encoded private key that has access to the root.
 
-- `--transactor-key` (`-t`): An optional argument that specifies the path of
-  a PEM-encoded private key for the transactor.
+- `--batcher-key` (`-t`): An optional argument that specifies the path of
+  a PEM-encoded private key for the batcher.
 
 #### `set-policy` Example
 
