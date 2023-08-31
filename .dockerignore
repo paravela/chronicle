@@ -1,6 +1,7 @@
 *
 !.VERSION
 !.cargo
+!target
 !Cargo.*
 !crates
 !domain_docs
